@@ -3,19 +3,18 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptrace"
+	"os"
 	"sync"
 	"time"
 )
 
-// TODO: add timeout on http request
 // TODO: add logger to application
-// TODO: add metrics function to the pipeline
 // TODO: add configs
-// TODO: add recover
 // TODO: add tests
 
 type SecurityReport struct {
@@ -24,10 +23,10 @@ type SecurityReport struct {
 }
 
 type Result struct {
-	Response           *http.Response
-	SecurityReport     SecurityReport
-	PerformanceMetrics PerformanceMetrics
-	Err                error
+	Response           *http.Response     `json:"-"`
+	SecurityReport     SecurityReport     `json:"security"`
+	PerformanceMetrics PerformanceMetrics `json:"metrics"`
+	Err                error              `json:"error"`
 }
 
 type traceTimings struct {
@@ -38,27 +37,45 @@ type traceTimings struct {
 	tlsStart     time.Time
 	tlsDone      time.Time
 	gotConn      time.Time
+	firstByte    time.Time
 }
 
 type PerformanceMetrics struct {
-	URL           string
-	DNSLookup     time.Duration
-	TCPConnection time.Duration
-	TLSHandshake  time.Duration
-	Total         time.Duration
-	StatusCode    int
-	ContentLength int
+	URL           string        `json:"url"`
+	DNSLookup     time.Duration `json:"dns_lookup"`
+	TCPConnection time.Duration `json:"tcp_connection"`
+	TLSHandshake  time.Duration `json:"tls_handshake"`
+	TTFB          time.Duration `json:"ttfb"`
+	Total         time.Duration `json:"total"`
+	StatusCode    int           `json:"status_code"`
+	ContentLength int           `json:"content_length"`
+}
+
+var defaultTransport = &http.Transport{
+	Proxy:                 http.ProxyFromEnvironment,
+	MaxIdleConns:          100,
+	MaxConnsPerHost:       32,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+}
+
+var httpClient = &http.Client{
+	Transport: defaultTransport,
+	Timeout:   15 * time.Second,
 }
 
 func fetch(ctx context.Context, url string) Result {
 	var timings traceTimings
 	var metrics PerformanceMetrics
 
+	metrics.URL = url
+
 	trace := &httptrace.ClientTrace{
-		DNSStart: func(di httptrace.DNSStartInfo) {
+		DNSStart: func(info httptrace.DNSStartInfo) {
 			timings.dnsStart = time.Now()
 		},
-		DNSDone: func(di httptrace.DNSDoneInfo) {
+		DNSDone: func(info httptrace.DNSDoneInfo) {
 			timings.dnsDone = time.Now()
 			metrics.DNSLookup = timings.dnsDone.Sub(timings.dnsStart)
 		},
@@ -79,40 +96,37 @@ func fetch(ctx context.Context, url string) Result {
 		GotConn: func(info httptrace.GotConnInfo) {
 			timings.gotConn = time.Now()
 		},
+		GotFirstResponseByte: func() {
+			timings.firstByte = time.Now()
+		},
 	}
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), http.MethodGet, url, nil)
 	if err != nil {
 		return Result{Err: err}
 	}
 
-	req = req.WithContext(httptrace.WithClientTrace(ctx, trace))
-
-	client := &http.Client{
-		Transport: &http.Transport{
-			DisableKeepAlives: true,
-		},
-	}
-
 	start := time.Now()
-	resp, err := client.Do(req)
-	metrics.Total = time.Since(start)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return Result{Err: err}
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return Result{Err: err}
+	if !timings.firstByte.IsZero() {
+		metrics.TTFB = timings.firstByte.Sub(start)
 	}
-	metrics.ContentLength = len(body)
 
+	n, _ := io.Copy(io.Discard, resp.Body)
+	if resp.ContentLength >= 0 {
+		metrics.ContentLength = int(resp.ContentLength)
+	} else {
+		metrics.ContentLength = int(n)
+	}
 	metrics.StatusCode = resp.StatusCode
-	metrics.URL = url
+	metrics.Total = time.Since(start)
 
-	fmt.Println(url)
-	return Result{Response: resp, Err: nil, PerformanceMetrics: metrics}
+	return Result{Response: resp, PerformanceMetrics: metrics}
 }
 
 func generator(ctx context.Context, urls ...string) chan Result {
@@ -193,14 +207,37 @@ func checkSecurity(ctx context.Context, ch chan Result) chan Result {
 
 func main() {
 	urls := []string{"https://google.com", "https://httpstat.us/400", "https://youtube.com", "https://twitch.tv"}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	for v := range checkSecurity(ctx, generator(ctx, urls...)) {
+	results := checkSecurity(ctx, generator(ctx, urls...))
+
+	var allResults []Result
+
+	for v := range results {
 		if v.Err != nil {
 			fmt.Println(v.Err.Error())
 			continue
 		}
+		allResults = append(allResults, v)
 		fmt.Println(v)
 	}
+
+	if err := exportJSON(allResults); err != nil {
+		fmt.Printf("JSON export error: %v\n", err)
+	}
+}
+
+func exportJSON(data []Result) error {
+	content, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+
+	err = os.WriteFile("results.json", content, 0644)
+	if err != nil {
+		return err
+	}
+	fmt.Println(data)
+	return nil
 }
