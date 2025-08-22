@@ -10,6 +10,7 @@ import (
 	"github.com/Veerl1br/Rpipeline/internal/export"
 	"github.com/Veerl1br/Rpipeline/internal/fetch"
 	"github.com/Veerl1br/Rpipeline/internal/security"
+	"go.uber.org/zap"
 )
 
 func generator(ctx context.Context, urls ...string) chan rpipeline.Result {
@@ -50,13 +51,19 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	logger, _ := zap.NewProduction()
+	defer logger.Sync()
+
 	results := security.CheckSecurity(ctx, generator(ctx, urls...))
 
 	var allResults []rpipeline.Result
 
 	for v := range results {
 		if v.Err != nil {
-			fmt.Println(v.Err.Error())
+			logger.Error("Request failed",
+				zap.Error(v.Err),
+				zap.String("url", v.PerformanceMetrics.URL),
+			)
 			continue
 		}
 		allResults = append(allResults, v)
@@ -64,6 +71,6 @@ func main() {
 	}
 
 	if err := export.ExportJSON(allResults); err != nil {
-		fmt.Printf("JSON export error: %v\n", err)
+		logger.Error("Failed to export results", zap.Error(err))
 	}
 }

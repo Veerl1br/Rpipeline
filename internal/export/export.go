@@ -2,7 +2,6 @@ package export
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 
 	rpipeline "github.com/Veerl1br/Rpipeline"
@@ -18,6 +17,5 @@ func ExportJSON(data []rpipeline.Result) error {
 	if err != nil {
 		return err
 	}
-	fmt.Println(data)
 	return nil
 }
